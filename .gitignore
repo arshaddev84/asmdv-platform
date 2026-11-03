@@ -1,0 +1,45 @@
+/target/
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/coverage/
+/web/.turbo/
+/web/.vercel/
+/web/tsconfig.tsbuildinfo
+/.github
+
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Private keys and local credentials
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+secrets/
+
+# Package manager and test output
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
+# Local logs and temporary files
+*.log
+*.pid
+*.swp
+*.swo
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
