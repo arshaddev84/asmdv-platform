@@ -1,0 +1,20 @@
+[package]
+name = "auth-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+platform-auth.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -11,11 +11,19 @@ import {
   LoaderCircle,
   PackageCheck,
   RefreshCw,
+  LogOut,
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-const inventoryApi = process.env.NEXT_PUBLIC_INVENTORY_API_URL ?? "http://localhost:4101";
-const procurementApi = process.env.NEXT_PUBLIC_PROCUREMENT_API_URL ?? "http://localhost:4102";
+const authApi = "/api/auth";
+const inventoryApi = "/api/v1/inventory";
+const procurementApi = "/api/v1";
+
+type Session = {
+  access_token: string;
+  expires_at: number;
+  user: { id: string; tenant_id: string; role: "admin" | "operator" | "viewer" };
+};
 
 type InventoryItem = {
   id: string;
@@ -65,8 +73,11 @@ type DraftLine = {
   unit_cost: number;
 };
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { cache: "no-store" });
+async function getJson<T>(url: string, token: string): Promise<T> {
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: { Authorization: `Bearer ${token}` },
+  });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.json() as Promise<T>;
 }
@@ -81,6 +92,11 @@ function weekdayLabel(days: number[]) {
 }
 
 export default function Home() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginPending, setLoginPending] = useState(false);
+  const [loginError, setLoginError] = useState("");
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [orders, setOrders] = useState<PurchaseOrder[]>([]);
   const [rules, setRules] = useState<ReplenishmentRule[]>([]);
@@ -97,15 +113,25 @@ export default function Home() {
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
+    if (!session) {
+      setLoading(false);
+      return;
+    }
     let active = true;
     setLoading(true);
 
     Promise.allSettled([
-      getJson<InventoryItem[]>(`${inventoryApi}/api/v1/inventory/reorder-candidates`),
-      getJson<PurchaseOrder[]>(`${procurementApi}/api/v1/purchase-orders/drafts`),
-      getJson<ReplenishmentRule[]>(`${procurementApi}/api/v1/replenishment-rules`),
+      getJson<InventoryItem[]>(`${inventoryApi}/reorder-candidates`, session.access_token),
+      getJson<PurchaseOrder[]>(`${procurementApi}/purchase-orders/drafts`, session.access_token),
+      getJson<ReplenishmentRule[]>(`${procurementApi}/replenishment-rules`, session.access_token),
     ]).then(([inventoryResult, ordersResult, rulesResult]) => {
       if (!active) return;
+      const results = [inventoryResult, ordersResult, rulesResult];
+      if (results.some((result) => result.status === "rejected" && String(result.reason).includes("401"))) {
+        setSession(null);
+        setLoading(false);
+        return;
+      }
       if (inventoryResult.status === "fulfilled") {
         setInventory(inventoryResult.value);
         setSelectedIds(inventoryResult.value.map((item) => item.id));
@@ -135,7 +161,17 @@ export default function Home() {
     return () => {
       active = false;
     };
-  }, [refreshKey]);
+  }, [refreshKey, session]);
+
+  useEffect(() => {
+    if (!session) return;
+    const expiryDelay = Math.max(0, session.expires_at * 1000 - Date.now());
+    const timer = window.setTimeout(() => {
+      setSession(null);
+      setNotice("Your session expired. Sign in again to continue.");
+    }, expiryDelay);
+    return () => window.clearTimeout(timer);
+  }, [session]);
 
   const selectedItems = useMemo(
     () => inventory.filter((item) => selectedIds.includes(item.id)),
@@ -146,6 +182,31 @@ export default function Home() {
     0,
   );
   const pendingApprovalCount = orders.filter((order) => order.status === "pending_approval").length;
+  const canCreateOrders = session?.user.role === "admin" || session?.user.role === "operator";
+  const canManageRules = session?.user.role === "admin";
+
+  async function signIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoginPending(true);
+    setLoginError("");
+    try {
+      const response = await fetch(`${authApi}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      if (!response.ok) throw new Error("Invalid email or password.");
+      const nextSession = (await response.json()) as Session;
+      setSession(nextSession);
+      setLoginPassword("");
+      setNotice("");
+    } catch {
+      setLoginError("Sign-in failed. Check your credentials and try again.");
+    } finally {
+      setLoginPending(false);
+    }
+  }
 
   function toggleItem(id: string) {
     setSelectedIds((current) =>
@@ -154,6 +215,7 @@ export default function Home() {
   }
 
   async function createDraftOrders() {
+    if (!session || !canCreateOrders) return;
     const groups = new Map<string, { supplier_id: string; supplier_name: string; lines: DraftLine[] }>();
     for (const item of selectedItems) {
       const group = groups.get(item.preferred_supplier_id) ?? {
@@ -175,11 +237,19 @@ export default function Home() {
     setNotice("");
     const results = await Promise.allSettled(
       [...groups.values()].map(async (group) => {
-        const response = await fetch(`${procurementApi}/api/v1/purchase-orders/drafts`, {
+        const response = await fetch(`${procurementApi}/purchase-orders/drafts`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          cache: "no-store",
           body: JSON.stringify(group),
         });
+        if (response.status === 401) {
+          setSession(null);
+          throw new Error("Session expired");
+        }
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
         return response.json() as Promise<PurchaseOrder>;
       }),
@@ -195,16 +265,25 @@ export default function Home() {
 
   async function saveRule(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!session || !canManageRules) return;
     const rule = rules[0];
     if (!rule) return;
     setSavingRule(true);
     setRuleError("");
     try {
-      const response = await fetch(`${procurementApi}/api/v1/replenishment-rules/${rule.id}`, {
+      const response = await fetch(`${procurementApi}/replenishment-rules/${rule.id}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        cache: "no-store",
         body: JSON.stringify({ enabled: ruleEnabled, run_at_local: scheduleTime }),
       });
+      if (response.status === 401) {
+        setSession(null);
+        return;
+      }
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       const updated = (await response.json()) as ReplenishmentRule;
       setRules([updated]);
@@ -216,6 +295,52 @@ export default function Home() {
     }
   }
 
+  if (!session) {
+    return (
+      <main className="login-shell">
+        <section className="login-panel" aria-labelledby="login-title">
+          <a className="brand" href="#login" aria-label="Northstar sign in">
+            <span className="brand-mark"><PackageCheck size={19} strokeWidth={2.2} /></span>
+            <span>northstar<span className="brand-period">.</span></span>
+          </a>
+          <p className="eyebrow login-eyebrow">DISTRIBUTION OPERATIONS</p>
+          <h1 id="login-title">Sign in</h1>
+          <p className="subheading login-subheading">Use your organization account to continue.</p>
+          {notice && <div className="notice" role="status">{notice}</div>}
+          <form className="login-form" onSubmit={signIn}>
+            <label>
+              <span>Email</span>
+              <input
+                type="email"
+                autoComplete="username"
+                required
+                maxLength={254}
+                value={loginEmail}
+                onChange={(event) => setLoginEmail(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Password</span>
+              <input
+                type="password"
+                autoComplete="current-password"
+                required
+                maxLength={1024}
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
+              />
+            </label>
+            {loginError && <p className="error-message login-error" role="alert">{loginError}</p>}
+            <button className="primary-button login-button" type="submit" disabled={loginPending}>
+              {loginPending && <LoaderCircle className="spin" size={16} />}
+              Sign in
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -225,6 +350,7 @@ export default function Home() {
         </a>
         <div className="topbar-right">
           <span className="tenant-name">Northstar Supply Co.</span>
+          <span className="role-chip">{session.user.role}</span>
           <span className="demo-chip">Synthetic demo</span>
           <button
             className="icon-button"
@@ -234,6 +360,15 @@ export default function Home() {
             onClick={() => setRefreshKey((key) => key + 1)}
           >
             <RefreshCw size={17} />
+          </button>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="Sign out"
+            title="Sign out"
+            onClick={() => setSession(null)}
+          >
+            <LogOut size={17} />
           </button>
         </div>
       </header>
@@ -275,7 +410,7 @@ export default function Home() {
                 <p className="eyebrow">STOCK CONTROL</p>
                 <h2>Reorder candidates</h2>
               </div>
-              <button
+              {canCreateOrders && <button
                 className="primary-button"
                 type="button"
                 onClick={createDraftOrders}
@@ -284,7 +419,7 @@ export default function Home() {
                 {creating ? <LoaderCircle className="spin" size={16} /> : <FilePlus2 size={16} />}
                 Create draft POs
                 <ArrowUpRight size={15} />
-              </button>
+              </button>}
             </div>
             {inventoryError && <p className="error-message">{inventoryError}</p>}
             <div className="table-wrap">
@@ -357,18 +492,20 @@ export default function Home() {
                   <div className="rule-detail">
                     <span>Time zone</span><strong>{rules[0].time_zone}</strong>
                   </div>
-                  <label className="time-field">
-                    <span>Review time</span>
-                    <input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} />
-                  </label>
-                  <label className="toggle-row">
-                    <span><strong>Rule enabled</strong><small>Approval required before a PO is released</small></span>
-                    <input type="checkbox" checked={ruleEnabled} onChange={(event) => setRuleEnabled(event.target.checked)} />
-                  </label>
-                  <button className="secondary-button" type="submit" disabled={savingRule}>
-                    {savingRule ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
-                    Save schedule settings
-                  </button>
+                  {canManageRules && <>
+                    <label className="time-field">
+                      <span>Review time</span>
+                      <input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} />
+                    </label>
+                    <label className="toggle-row">
+                      <span><strong>Rule enabled</strong><small>Approval required before a PO is released</small></span>
+                      <input type="checkbox" checked={ruleEnabled} onChange={(event) => setRuleEnabled(event.target.checked)} />
+                    </label>
+                    <button className="secondary-button" type="submit" disabled={savingRule}>
+                      {savingRule ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+                      Save schedule settings
+                    </button>
+                  </>}
                   <p className="schedule-footnote">Settings are saved; scheduled execution is not active in this MVP.</p>
                 </form>
               ) : loading ? (

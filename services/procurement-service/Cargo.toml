@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+platform-auth.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

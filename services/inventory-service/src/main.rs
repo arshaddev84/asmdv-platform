@@ -2,21 +2,22 @@ use std::{env, net::SocketAddr};
 
 use anyhow::Context;
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use platform_auth::{authenticate, Claims, JwtVerifier};
 use serde::Serialize;
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    tenant_id: Uuid,
 }
 
 #[derive(FromRow)]
@@ -117,7 +118,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn load_inventory(state: &AppState) -> Result<Vec<InventoryItem>, ApiError> {
+async fn load_inventory(state: &AppState, tenant_id: Uuid) -> Result<Vec<InventoryItem>, ApiError> {
     let rows = sqlx::query_as::<_, InventoryRow>(
         "SELECT p.id, p.sku, p.name, p.category, p.unit_of_measure, \
                 p.reorder_point, p.target_stock, p.unit_cost::float8 AS unit_cost, \
@@ -128,7 +129,7 @@ async fn load_inventory(state: &AppState) -> Result<Vec<InventoryItem>, ApiError
          WHERE p.tenant_id = $1 AND p.is_active = TRUE \
          ORDER BY p.name",
     )
-    .bind(state.tenant_id)
+    .bind(tenant_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -137,14 +138,16 @@ async fn load_inventory(state: &AppState) -> Result<Vec<InventoryItem>, ApiError
 
 async fn list_inventory(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<InventoryItem>>, ApiError> {
-    Ok(Json(load_inventory(&state).await?))
+    Ok(Json(load_inventory(&state, claims.tenant_id).await?))
 }
 
 async fn list_reorder_candidates(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<InventoryItem>>, ApiError> {
-    let items = load_inventory(&state)
+    let items = load_inventory(&state, claims.tenant_id)
         .await?
         .into_iter()
         .filter(|item| item.suggested_order_qty > 0)
@@ -165,10 +168,6 @@ async fn main() -> anyhow::Result<()> {
     let database_url = env::var("INVENTORY_DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5432/distributor_inventory".to_owned()
     });
-    let tenant_id = env::var("DEMO_TENANT_ID")
-        .unwrap_or_else(|_| "10000000-0000-4000-8000-000000000001".to_owned())
-        .parse::<Uuid>()
-        .context("DEMO_TENANT_ID must be a UUID")?;
     let port = env::var("INVENTORY_PORT")
         .unwrap_or_else(|_| "4101".to_owned())
         .parse::<u16>()
@@ -179,15 +178,23 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await
         .context("connect to inventory database")?;
-    let app = Router::new()
-        .route("/health", get(health))
+    let issuer = env::var("JWT_ISSUER").unwrap_or_else(|_| "asmdv-auth".to_owned());
+    let audience = env::var("JWT_AUDIENCE").unwrap_or_else(|_| "asmdv-platform".to_owned());
+    let public_key_path = env::var("JWT_PUBLIC_KEY_PATH")
+        .unwrap_or_else(|_| "/run/secrets/jwt-public.pem".to_owned());
+    let verifier = JwtVerifier::from_rsa_pem(&public_key_path, issuer, audience)
+        .context("load JWT verification key")?;
+    let protected_routes = Router::new()
         .route("/api/v1/inventory", get(list_inventory))
         .route(
             "/api/v1/inventory/reorder-candidates",
             get(list_reorder_candidates),
         )
-        .with_state(AppState { pool, tenant_id })
-        .layer(CorsLayer::permissive())
+        .route_layer(middleware::from_fn_with_state(verifier, authenticate));
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected_routes)
+        .with_state(AppState { pool })
         .layer(TraceLayer::new_for_http());
 
     let address = SocketAddr::from(([0, 0, 0, 0], port));

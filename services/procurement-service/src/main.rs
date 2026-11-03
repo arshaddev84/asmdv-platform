@@ -2,21 +2,22 @@ use std::{env, net::SocketAddr};
 
 use anyhow::Context;
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use platform_auth::{authenticate, Claims, JwtVerifier};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    tenant_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +102,14 @@ impl IntoResponse for ApiError {
 
 async fn create_draft(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(request): Json<CreateDraftRequest>,
 ) -> Result<(StatusCode, Json<DraftOrderResponse>), ApiError> {
+    if !claims.role.can_create_purchase_orders() {
+        return Err(ApiError::InvalidRequest(
+            "role is not permitted to create purchase orders",
+        ));
+    }
     if request.lines.is_empty()
         || request.lines.iter().any(|line| {
             line.quantity <= 0
@@ -132,7 +139,7 @@ async fn create_draft(
          VALUES ($1, $2, $3, 'draft', 'USD', $4, $5) \
          RETURNING id, order_number",
     )
-    .bind(state.tenant_id)
+    .bind(claims.tenant_id)
     .bind(request.supplier_id)
     .bind(&request.supplier_name)
     .bind(total)
@@ -155,6 +162,7 @@ async fn create_draft(
 
 async fn list_drafts(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<DraftOrderResponse>>, ApiError> {
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, i32, f64)>(
         "SELECT id, order_number, supplier_name, status, jsonb_array_length(lines), total_amount::float8 \
@@ -162,7 +170,7 @@ async fn list_drafts(
          WHERE tenant_id = $1 AND status IN ('draft', 'pending_approval') \
          ORDER BY created_at DESC LIMIT 50",
     )
-    .bind(state.tenant_id)
+    .bind(claims.tenant_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -184,6 +192,7 @@ async fn list_drafts(
 
 async fn list_replenishment_rules(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<ReplenishmentRule>>, ApiError> {
     let rows = sqlx::query_as::<_, ReplenishmentRule>(
         "SELECT id, name, enabled, frequency, days_of_week, \
@@ -194,7 +203,7 @@ async fn list_replenishment_rules(
          FROM procurement.replenishment_rules \
          WHERE tenant_id = $1 ORDER BY name",
     )
-    .bind(state.tenant_id)
+    .bind(claims.tenant_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -213,9 +222,15 @@ fn is_valid_hhmm(value: &str) -> bool {
 
 async fn update_replenishment_rule(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(rule_id): Path<Uuid>,
     Json(request): Json<UpdateRuleRequest>,
 ) -> Result<Json<ReplenishmentRule>, ApiError> {
+    if !claims.role.can_manage_replenishment() {
+        return Err(ApiError::InvalidRequest(
+            "role is not permitted to manage replenishment rules",
+        ));
+    }
     if !is_valid_hhmm(&request.run_at_local) {
         return Err(ApiError::InvalidRequest(
             "run_at_local must use 24-hour HH:MM format",
@@ -233,7 +248,7 @@ async fn update_replenishment_rule(
                    time_zone, approval_required",
     )
     .bind(rule_id)
-    .bind(state.tenant_id)
+    .bind(claims.tenant_id)
     .bind(request.enabled)
     .bind(request.run_at_local)
     .fetch_optional(&state.pool)
@@ -256,10 +271,6 @@ async fn main() -> anyhow::Result<()> {
     let database_url = env::var("PROCUREMENT_DATABASE_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5433/distributor_procurement".to_owned()
     });
-    let tenant_id = env::var("DEMO_TENANT_ID")
-        .unwrap_or_else(|_| "10000000-0000-4000-8000-000000000001".to_owned())
-        .parse::<Uuid>()
-        .context("DEMO_TENANT_ID must be a UUID")?;
     let port = env::var("PROCUREMENT_PORT")
         .unwrap_or_else(|_| "4102".to_owned())
         .parse::<u16>()
@@ -270,8 +281,13 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await
         .context("connect to procurement database")?;
-    let app = Router::new()
-        .route("/health", get(health))
+    let issuer = env::var("JWT_ISSUER").unwrap_or_else(|_| "asmdv-auth".to_owned());
+    let audience = env::var("JWT_AUDIENCE").unwrap_or_else(|_| "asmdv-platform".to_owned());
+    let public_key_path = env::var("JWT_PUBLIC_KEY_PATH")
+        .unwrap_or_else(|_| "/run/secrets/jwt-public.pem".to_owned());
+    let verifier = JwtVerifier::from_rsa_pem(&public_key_path, issuer, audience)
+        .context("load JWT verification key")?;
+    let protected_routes = Router::new()
         .route(
             "/api/v1/purchase-orders/drafts",
             get(list_drafts).post(create_draft),
@@ -281,8 +297,11 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/replenishment-rules/:rule_id",
             axum::routing::patch(update_replenishment_rule),
         )
-        .with_state(AppState { pool, tenant_id })
-        .layer(CorsLayer::permissive())
+        .route_layer(middleware::from_fn_with_state(verifier, authenticate));
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected_routes)
+        .with_state(AppState { pool })
         .layer(TraceLayer::new_for_http());
 
     let address = SocketAddr::from(([0, 0, 0, 0], port));

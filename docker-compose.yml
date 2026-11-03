@@ -1,18 +1,31 @@
 services:
+  auth-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: distributor_auth
+      POSTGRES_USER: ${DEMO_DB_USER:-demo}
+      POSTGRES_PASSWORD: ${DEMO_DB_PASSWORD:-demo-local-only}
+    volumes:
+      - auth_data:/var/lib/postgresql/data
+      - ./services/auth-service/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DEMO_DB_USER:-demo} -d distributor_auth"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   inventory-db:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: distributor_inventory
       POSTGRES_USER: ${DEMO_DB_USER:-demo}
       POSTGRES_PASSWORD: ${DEMO_DB_PASSWORD:-demo-local-only}
-    ports:
-      - "127.0.0.1:${INVENTORY_DB_HOST_PORT:-15432}:5432"
     volumes:
       - inventory_data:/var/lib/postgresql/data
       - ./services/inventory-service/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./data/synthetic_inventory.sql:/docker-entrypoint-initdb.d/02-synthetic-data.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U demo -d distributor_inventory"]
+      test: ["CMD-SHELL", "pg_isready -U ${DEMO_DB_USER:-demo} -d distributor_inventory"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -23,17 +36,39 @@ services:
       POSTGRES_DB: distributor_procurement
       POSTGRES_USER: ${DEMO_DB_USER:-demo}
       POSTGRES_PASSWORD: ${DEMO_DB_PASSWORD:-demo-local-only}
-    ports:
-      - "127.0.0.1:${PROCUREMENT_DB_HOST_PORT:-15433}:5432"
     volumes:
       - procurement_data:/var/lib/postgresql/data
       - ./services/procurement-service/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./data/synthetic_procurement.sql:/docker-entrypoint-initdb.d/02-synthetic-data.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U demo -d distributor_procurement"]
+      test: ["CMD-SHELL", "pg_isready -U ${DEMO_DB_USER:-demo} -d distributor_procurement"]
       interval: 3s
       timeout: 3s
       retries: 20
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    environment:
+      AUTH_DATABASE_URL: postgres://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo-local-only}@auth-db:5432/distributor_auth
+      AUTH_BOOTSTRAP_TENANT_ID: ${AUTH_BOOTSTRAP_TENANT_ID:-10000000-0000-4000-8000-000000000001}
+      AUTH_BOOTSTRAP_TENANT_NAME: ${AUTH_BOOTSTRAP_TENANT_NAME:-Northstar Supply Co.}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:?Set AUTH_BOOTSTRAP_EMAIL}
+      AUTH_BOOTSTRAP_PASSWORD_FILE: /run/secrets/bootstrap-password
+      JWT_ISSUER: ${JWT_ISSUER:-asmdv-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-asmdv-platform}
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt-private.pem
+      AUTH_PORT: 4100
+      RUST_LOG: info
+    secrets:
+      - source: jwt_private
+        target: jwt-private.pem
+      - source: auth_bootstrap_password
+        target: bootstrap-password
+    depends_on:
+      auth-db:
+        condition: service_healthy
 
   inventory-service:
     build:
@@ -41,11 +76,14 @@ services:
       dockerfile: services/inventory-service/Dockerfile
     environment:
       INVENTORY_DATABASE_URL: postgres://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo-local-only}@inventory-db:5432/distributor_inventory
-      DEMO_TENANT_ID: ${DEMO_TENANT_ID:-10000000-0000-4000-8000-000000000001}
+      JWT_ISSUER: ${JWT_ISSUER:-asmdv-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-asmdv-platform}
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt-public.pem
       INVENTORY_PORT: 4101
       RUST_LOG: info
-    ports:
-      - "127.0.0.1:${INVENTORY_API_PORT:-4101}:4101"
+    secrets:
+      - source: jwt_public
+        target: jwt-public.pem
     depends_on:
       inventory-db:
         condition: service_healthy
@@ -56,11 +94,14 @@ services:
       dockerfile: services/procurement-service/Dockerfile
     environment:
       PROCUREMENT_DATABASE_URL: postgres://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo-local-only}@procurement-db:5432/distributor_procurement
-      DEMO_TENANT_ID: ${DEMO_TENANT_ID:-10000000-0000-4000-8000-000000000001}
+      JWT_ISSUER: ${JWT_ISSUER:-asmdv-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-asmdv-platform}
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt-public.pem
       PROCUREMENT_PORT: 4102
       RUST_LOG: info
-    ports:
-      - "127.0.0.1:${PROCUREMENT_API_PORT:-4102}:4102"
+    secrets:
+      - source: jwt_public
+        target: jwt-public.pem
     depends_on:
       procurement-db:
         condition: service_healthy
@@ -69,15 +110,38 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_INVENTORY_API_URL: ${NEXT_PUBLIC_INVENTORY_API_URL:-http://localhost:4101}
-        NEXT_PUBLIC_PROCUREMENT_API_URL: ${NEXT_PUBLIC_PROCUREMENT_API_URL:-http://localhost:4102}
-    ports:
-      - "127.0.0.1:${WEB_PORT:-3000}:3000"
     depends_on:
       - inventory-service
       - procurement-service
 
+  nginx:
+    image: nginx:1.28-alpine
+    ports:
+      - "${NGINX_HOST_BIND:-127.0.0.1}:${NGINX_HTTP_HOST_PORT:-8080}:80"
+      - "${NGINX_HOST_BIND:-127.0.0.1}:${NGINX_HTTPS_HOST_PORT:-8443}:443"
+    volumes:
+      - ${NGINX_CONFIG_FILE:-./nginx/local.conf}:/etc/nginx/conf.d/default.conf:ro
+      - ./secrets:/etc/nginx/tls:ro
+    depends_on:
+      - web
+      - auth-service
+      - inventory-service
+      - procurement-service
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
 volumes:
+  auth_data:
   inventory_data:
   procurement_data:
+
+secrets:
+  jwt_private:
+    file: ${JWT_PRIVATE_KEY_FILE:-./secrets/jwt-private.pem}
+  jwt_public:
+    file: ${JWT_PUBLIC_KEY_FILE:-./secrets/jwt-public.pem}
+  auth_bootstrap_password:
+    file: ${AUTH_BOOTSTRAP_PASSWORD_FILE:-./secrets/dev-bootstrap-password}
